@@ -1,0 +1,39 @@
+﻿# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Processed database and generated data
+data/processed/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# IDE and editor
+.vscode/
+.idea/
+
+# Operating system
+.DS_Store
+Thumbs.db
+
+# Raw source dataset
+/data/raw/
+
+# Local backup files
+*_backup.py
+
+# Local pre-change snapshots
+*_before_*.py
