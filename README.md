@@ -106,7 +106,7 @@ Python 3.12 is recommended.
 ### Windows PowerShell
 
 ```powershell
-git clone https://github.com/YOUR_USERNAME/NoshAI.git
+git clone https://github.com/tousifta07-cyber/NoshAI.git
 cd NoshAI
 
 py -3.12 -m venv .venv
@@ -122,10 +122,10 @@ Open `.env` and add your Google Gemini API key:
 
 ```text
 GEMINI_API_KEY=your_actual_api_key
-GEMINI_MODEL=gemini-3.7-flash
+GEMINI_MODEL=gemini-3.5-flash-lite
 ```
 
-The current intent-parser configuration defaults to `gemini-3.7-flash` when `GEMINI_MODEL` is not supplied. Use a model identifier enabled for your Google AI Studio API key if that default is unavailable to your account.
+The intent parser defaults to `gemini-3.5-flash-lite` when `GEMINI_MODEL` is not supplied. Use a model identifier enabled for your Google AI Studio API key if needed.
 
 Do not commit `.env` or share the API key.
 
@@ -181,7 +181,7 @@ The exact questions supported depend on the available dataset and implemented fu
 python -m pytest -v
 ```
 
-The current test suite contains ingredient-matching and substitution tests.
+The current automated test suite contains 27 tests covering ingredient matching, exclusions, ranking, and substitution logic. Run the command above to verify the suite.
 
 ## Evaluation
 

@@ -612,6 +612,7 @@ def _matches_dairy_category(recipe_line):
         "ricotta",
         "mascarpone",
         "parmesan",
+        "parmigiano",
         "mozzarella",
         "cheddar",
         "feta",
@@ -923,11 +924,34 @@ def title_quality_rank(title):
     return 0
 
 
+RELIABLE_STEP_METHODS = {
+    "numbered-step estimate",
+    "bullet-step estimate",
+}
+
+
+def step_limit_status(result, max_steps):
+    """Check a hard step limit using structured step counts only."""
+
+    if max_steps is None:
+        return "eligible"
+
+    method = result.get("step_estimate_method")
+    steps = result.get("estimated_steps")
+
+    if method not in RELIABLE_STEP_METHODS or steps is None:
+        return "unverified"
+
+    if steps > max_steps:
+        return "exceeds_limit"
+
+    return "eligible"
+
+
 def ranking_key(result, prefer_fewer_steps):
     """
     Rank recipes by ingredient matching and quantity quality.
-    Prefer actual dishes over preparation-only titles when
-    the ingredient-match quality is comparable.
+    When requested, verified lower step counts take priority.
     """
 
     reliable_methods = {
@@ -944,18 +968,23 @@ def ranking_key(result, prefer_fewer_steps):
     else:
         step_rank = 10**9
 
-    return (
+    base_rank = (
         -result["matched_count"],
         result["missing_count"],
         result["quantity_insufficient_count"],
         result["quantity_unverified_count"],
         -result["quantity_sufficient_count"],
         title_quality_rank(result["title"]),
-        step_rank,
         result["additional_count"],
         result["title"].casefold(),
         result["recipe_id"],
     )
+
+    if prefer_fewer_steps:
+        return (step_rank,) + base_rank
+
+    return base_rank
+
 
 # ==================================================
 # 10. DUPLICATE RECIPE DETECTION
@@ -1203,6 +1232,7 @@ def match_recipes(
     max_missing=None,
     limit=5,
     prefer_fewer_steps=False,
+    max_steps=None,
 ):
 
     """
@@ -1229,6 +1259,16 @@ def match_recipes(
 
             raise ValueError(
                 "max_missing must be a non-negative integer."
+            )
+
+    if max_steps is not None:
+        if (
+            not isinstance(max_steps, int)
+            or isinstance(max_steps, bool)
+            or max_steps < 1
+        ):
+            raise ValueError(
+                "max_steps must be a positive integer."
             )
 
     if not ingredients:
@@ -1313,6 +1353,9 @@ def match_recipes(
 
     recipes_blocked_by_exclusion = 0
 
+    recipes_excluded_by_step_limit = 0
+    recipes_excluded_unverified_step_count = 0
+
     recipes_with_any_match = 0
 
     recipes_qualifying = 0
@@ -1335,6 +1378,8 @@ def match_recipes(
 
         nonlocal recipes_evaluated
         nonlocal recipes_blocked_by_exclusion
+        nonlocal recipes_excluded_by_step_limit
+        nonlocal recipes_excluded_unverified_step_count
         nonlocal recipes_with_any_match
         nonlocal recipes_qualifying
         nonlocal exact_matches
@@ -1391,6 +1436,16 @@ def match_recipes(
         # ------------------------------------------
         # Apply maximum missing ingredient filter.
         # ------------------------------------------
+
+        step_status = step_limit_status(result, max_steps)
+
+        if step_status == "exceeds_limit":
+            recipes_excluded_by_step_limit += 1
+            return
+
+        if step_status == "unverified":
+            recipes_excluded_unverified_step_count += 1
+            return
 
         if (
             max_missing is not None
@@ -1622,6 +1677,16 @@ def match_recipes(
 
         "max_missing": max_missing,
 
+        "max_steps": max_steps,
+
+        "recipes_excluded_by_step_limit": (
+            recipes_excluded_by_step_limit
+        ),
+
+        "recipes_excluded_unverified_step_count": (
+            recipes_excluded_unverified_step_count
+        ),
+
         "prefer_fewer_steps": prefer_fewer_steps,
 
     }
@@ -1706,6 +1771,20 @@ def display_results(output):
         print(
             "Unstructured line and sentence estimates do not "
             "control this ranking."
+        )
+
+    if output.get("max_steps") is not None:
+        print(
+            "Hard maximum instruction steps:",
+            output["max_steps"]
+        )
+        print(
+            "Excluded for exceeding step limit:",
+            output["recipes_excluded_by_step_limit"]
+        )
+        print(
+            "Excluded because step count was unverified:",
+            output["recipes_excluded_unverified_step_count"]
         )
 
     if output["hard_exclusions"]:
@@ -1937,6 +2016,16 @@ def main():
     )
 
     parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help=(
+            "Hard maximum instruction steps. "
+            "Unstructured step counts are excluded."
+        )
+    )
+
+    parser.add_argument(
         "--prefer-fewer-steps",
         action="store_true",
         help=(
@@ -1969,6 +2058,7 @@ def main():
             limit=args.limit,
 
             prefer_fewer_steps=args.prefer_fewer_steps,
+            max_steps=args.max_steps,
 
         )
 

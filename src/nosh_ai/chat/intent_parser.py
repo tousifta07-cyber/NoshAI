@@ -1,4 +1,5 @@
 import json
+import re
 import os
 import time
 from pathlib import Path
@@ -19,14 +20,22 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not API_KEY:
     raise ValueError("GEMINI_API_KEY was not found in .env")
 
 # Reuse one client for all requests.
-CLIENT = genai.Client(api_key=API_KEY)
+CLIENT = genai.Client(
+    api_key=API_KEY,
+    http_options=types.HttpOptions(
+        timeout=30_000,
+        retry_options=types.HttpRetryOptions(
+            attempts=1
+        ),
+    ),
+)
 
 
 # ==================================================
@@ -66,6 +75,16 @@ class RecipeIntent(BaseModel):
 
     ingredients: list[str] = Field(default_factory=list)
 
+    max_steps: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=100
+    )
+
+    prefer_fewer_steps: bool = False
+
+    nutrition_question: bool = False
+
     hard_exclusions: list[str] = Field(default_factory=list)
     add_hard_exclusions: list[str] = Field(default_factory=list)
     remove_hard_exclusions: list[str] = Field(default_factory=list)
@@ -83,7 +102,60 @@ class RecipeIntent(BaseModel):
 # 3. INTENT NORMALIZATION
 # ==================================================
 
-def normalize_intent(intent: dict) -> dict:
+
+
+def extract_explicit_max_steps(user_message: str | None) -> int | None:
+    """Extract an explicitly requested maximum number of recipe steps."""
+
+    if not user_message:
+        return None
+
+    number_words = {
+        "one": 1, "two": 2, "three": 3, "four": 4,
+        "five": 5, "six": 6, "seven": 7, "eight": 8,
+        "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+        "thirteen": 13, "fourteen": 14, "fifteen": 15,
+        "sixteen": 16, "seventeen": 17, "eighteen": 18,
+        "nineteen": 19, "twenty": 20,
+    }
+
+    count_pattern = (
+        r"(?P<count>\d+|"
+        + "|".join(number_words)
+        + r")"
+    )
+
+    patterns = [
+        r"(?:at most|no more than|up to)\s+"
+        + count_pattern
+        + r"\s+(?:(?:instruction|cooking)\s+)?steps?\b",
+
+        count_pattern
+        + r"\s+or fewer\s+(?:(?:instruction|cooking)\s+)?steps?\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, user_message, re.IGNORECASE)
+
+        if match:
+            raw_count = match.group("count").casefold()
+            count = (
+                int(raw_count)
+                if raw_count.isdigit()
+                else number_words[raw_count]
+            )
+
+            if 1 <= count <= 100:
+                return count
+
+    return None
+
+
+def normalize_intent(
+    intent: dict,
+    conversation_context: dict | None = None,
+    user_message: str | None = None,
+) -> dict:
     """
     Apply deterministic corrections to Gemini's intent.
 
@@ -91,6 +163,70 @@ def normalize_intent(intent: dict) -> dict:
     """
 
     intent = dict(intent)
+
+    explicit_max_steps = extract_explicit_max_steps(user_message)
+    if explicit_max_steps is not None:
+        intent["max_steps"] = explicit_max_steps
+
+    # Deterministically recognize a preference for fewer instruction steps.
+    # This is a ranking preference, not a hard maximum.
+    latest_message = (user_message or "").casefold()
+
+    fewer_steps_patterns = (
+        r"\bfewest\s+(?:instruction\s+)?steps?\b",
+        r"\bleast\s+(?:instruction\s+)?steps?\b",
+        r"\bprefer\s+fewer\s+(?:instruction\s+)?steps?\b",
+        r"\bfewer\s+(?:instruction\s+)?steps?\b",
+        r"\bminimum\s+(?:number\s+of\s+)?steps?\b",
+    )
+
+    if any(
+        re.search(pattern, latest_message)
+        for pattern in fewer_steps_patterns
+    ):
+        intent["prefer_fewer_steps"] = True
+
+        # A request to rank recipes by instruction steps is a
+        # recipe-matching request, not a dataset-statistics request.
+        if intent.get("action") == "analytics":
+            intent["action"] = "match"
+
+        # Preserve the ingredient requested by the user.
+        if not intent.get("ingredients") and intent.get("query"):
+            intent["ingredients"] = [intent["query"]]
+            intent["query"] = None
+
+    # Detect nutrition questions about a named recipe.
+    nutrition_terms = (
+        "calorie", "calories", "nutrition", "nutritional",
+        "protein", "carbohydrate", "carbs", "fat", "fats",
+        "sugar", "sodium"
+    )
+
+    nutrition_question = any(
+        re.search(r"\b" + re.escape(term) + r"\b", latest_message)
+        for term in nutrition_terms
+    )
+
+    if nutrition_question:
+        intent["nutrition_question"] = True
+
+        # Extract the title after common nutrition question wording.
+        title_patterns = (
+            r"\b(?:servings?\s+of)\s+(.+?)\s*[?.!]*$",
+            r"\b(?:in|for)\s+(?:one|a|an|the)\s+servings?\s+of\s+(.+?)\s*[?.!]*$",
+            r"\b(?:calories?|nutrition|protein|carbs?|fat|sugar|sodium)\s+(?:in|for)\s+(.+?)\s*[?.!]*$",
+        )
+
+        if not intent.get("recipe_title"):
+            for pattern in title_patterns:
+                title_match = re.search(pattern, latest_message)
+                if title_match:
+                    intent["recipe_title"] = title_match.group(1).strip()
+                    break
+
+        if intent.get("recipe_title") or intent.get("recipe_id"):
+            intent["action"] = "details"
 
     existing_exclusions = intent.get("hard_exclusions") or []
     added_exclusions = intent.get("add_hard_exclusions") or []
@@ -103,14 +239,53 @@ def normalize_intent(intent: dict) -> dict:
 
         intent["action"] = "match"
 
-    # If Gemini identifies a match request but puts the required
-    # ingredient in query, move it into ingredients.
-    if (
+    # Detect an exclusion-only follow-up to a previous search.
+    # A remembered search query must not become a new required ingredient.
+    context = conversation_context or {}
+    latest_message = (user_message or "").casefold()
+
+    previous_search_exists = bool(
+        context.get("last_action") in {"search", "match"}
+        and context.get("last_search_query")
+        and context.get("recent_results")
+    )
+
+    proposed_ingredients = (
+        intent.get("ingredients")
+        or ([intent.get("query")] if intent.get("query") else [])
+    )
+
+    excluded_terms = {
+        str(item).strip().casefold()
+        for item in (
+            existing_exclusions + added_exclusions
+        )
+    }
+
+    explicitly_requested_ingredient = any(
+        str(term).strip()
+        and str(term).strip().casefold() not in excluded_terms
+        and str(term).strip().casefold() in latest_message
+        for term in proposed_ingredients
+    )
+
+    exclusion_only_followup = (
+        intent.get("action") == "match"
+        and previous_search_exists
+        and has_exclusions
+        and not explicitly_requested_ingredient
+    )
+
+    if exclusion_only_followup:
+        intent["ingredients"] = []
+        intent["query"] = None
+
+    # Otherwise, convert a new match query into required ingredients.
+    elif (
         intent.get("action") == "match"
         and not intent.get("ingredients")
         and intent.get("query")
     ):
-
         intent["ingredients"] = [intent["query"]]
         intent["query"] = None
 
@@ -261,6 +436,11 @@ IMPORTANT RULES:
     replacement_ingredient: "olive oil"
     recipe_number: 2
 
+24. MAXIMUM INSTRUCTION STEPS:
+    When the user explicitly requests a hard maximum such as
+    "at most six steps", set max_steps to that integer.
+    If the user only prefers fewer steps, leave max_steps null.
+
 CONVERSATION CONTEXT:
 {context}
 
@@ -290,7 +470,7 @@ USER'S LATEST MESSAGE:
 
                 parsed_intent = response.parsed.model_dump()
 
-                return normalize_intent(parsed_intent)
+                return normalize_intent(parsed_intent, conversation_context, user_message)
 
             if response.text:
 
@@ -298,7 +478,7 @@ USER'S LATEST MESSAGE:
                     response.text
                 ).model_dump()
 
-                return normalize_intent(parsed_intent)
+                return normalize_intent(parsed_intent, conversation_context, user_message)
 
             raise ValueError(
                 "Gemini returned an empty intent response."

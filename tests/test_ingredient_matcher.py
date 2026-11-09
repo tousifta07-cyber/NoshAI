@@ -567,7 +567,7 @@ def test_sentence_proxy_does_not_control_step_ranking():
 
     # A sentence proxy must not rank ahead of
     # a recipe with a structured step estimate.
-    assert structured_key[6] < proxy_key[6]
+    assert structured_key[0] < proxy_key[0]
     
 def test_generic_garlic_rejects_garlic_marinade():
 

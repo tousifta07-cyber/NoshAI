@@ -136,6 +136,7 @@ class NoshAssistant:
         self.state = {
             "active_hard_exclusions": [],
             "active_required_ingredients": [],
+            "active_max_steps": None,
             "last_results": [],
             "last_search_query": None,
             "last_search_in": "all",
@@ -345,6 +346,147 @@ class NoshAssistant:
     # 8. RECIPE ANALYTICS - TASK 1
     # ==================================================
 
+
+    def analyze_ingredient_pair(self, first, second, limit=10):
+        """
+        Count distinct recipes containing both requested ingredients.
+
+        Ingredient presence is checked against searchable normalized
+        ingredient lines. The percentage denominator is every recipe
+        record, including records with incomplete ingredient data.
+        """
+
+        limit = validate_limit(limit)
+
+        def make_pattern(term):
+            term = str(term).strip().casefold()
+
+            if not term or not re.fullmatch(r"[a-z][a-z -]*", term):
+                raise ValueError("Unsupported ingredient term in pair query.")
+
+            if term in {"onion", "onions"}:
+                return re.compile(
+                    r"\b(?:onions?|scallions?|spring\s+onions?)\b",
+                    re.IGNORECASE
+                )
+
+            tokens = re.findall(r"[a-z]+", term)
+            if not tokens:
+                raise ValueError("Invalid ingredient term.")
+
+            phrase = r"\s+".join(re.escape(token) for token in tokens)
+            return re.compile(
+                r"\b" + phrase + r"\b",
+                re.IGNORECASE
+            )
+
+        first_pattern = make_pattern(first)
+        second_pattern = make_pattern(second)
+
+        first_ids = set()
+        second_ids = set()
+
+        connection = self.get_connection()
+
+        try:
+            dataset_recipe_count = connection.execute(
+                "SELECT COUNT(*) FROM recipes"
+            ).fetchone()[0]
+
+            cursor = connection.execute(
+                """
+                SELECT recipe_id, ingredient_normalized
+                FROM recipe_ingredients
+                WHERE is_searchable = 1
+                  AND ingredient_normalized IS NOT NULL
+                  AND ingredient_normalized != ''
+                """
+            )
+
+            while True:
+                batch = cursor.fetchmany(10000)
+                if not batch:
+                    break
+
+                for row in batch:
+                    recipe_id = row["recipe_id"]
+                    ingredient_text = row["ingredient_normalized"]
+
+                    if first_pattern.search(ingredient_text):
+                        first_ids.add(recipe_id)
+
+                    if second_pattern.search(ingredient_text):
+                        second_ids.add(recipe_id)
+
+            both_ids = first_ids.intersection(second_ids)
+            both_count = len(both_ids)
+
+            percentage = (
+                round(100.0 * both_count / dataset_recipe_count, 4)
+                if dataset_recipe_count else None
+            )
+
+            sample_ids = sorted(both_ids)[:limit]
+            sample = []
+
+            if sample_ids:
+                placeholders = ",".join("?" for _ in sample_ids)
+
+                sample_rows = connection.execute(
+                    f"""
+                    SELECT recipe_id, title_original
+                    FROM recipes
+                    WHERE recipe_id IN ({placeholders})
+                    """,
+                    sample_ids
+                ).fetchall()
+
+                sample_by_id = {
+                    row["recipe_id"]: row["title_original"]
+                    for row in sample_rows
+                }
+
+                sample = [
+                    {
+                        "recipe_id": recipe_id,
+                        "title": sample_by_id.get(recipe_id)
+                    }
+                    for recipe_id in sample_ids
+                ]
+
+            return {
+                "analysis_type": "ingredient_cooccurrence",
+                "query": f"recipes containing both {first} and {second}",
+                "requested_ingredients": [first, second],
+                "ingredient_recipe_counts": {
+                    first: len(first_ids),
+                    second: len(second_ids),
+                },
+                "recipes_containing_both": both_count,
+                "total_recipes": both_count,
+                "dataset_recipe_count": dataset_recipe_count,
+                "percentage_of_dataset": percentage,
+                "calculation": (
+                    f"{both_count} / {dataset_recipe_count} * 100"
+                ),
+                "statistics_scope": (
+                    "All recipe records; ingredient presence is checked "
+                    "using searchable ingredient lines."
+                ),
+                "normalization_method": (
+                    "Case-insensitive token-boundary matching on "
+                    "ingredient_normalized. Onion includes onion/onions, "
+                    "scallion/scallions and spring onion(s). Each recipe "
+                    "is counted once per ingredient. This is lexical "
+                    "normalization, not a complete culinary ontology."
+                ),
+                "sample_recipes": sample,
+                "sample_limit": limit,
+            }
+
+        finally:
+            connection.close()
+
     def analyze_recipes(
         self,
         query,
@@ -360,6 +502,19 @@ class NoshAssistant:
         """
 
         limit = validate_limit(limit)
+
+        pair_match = re.search(
+            r"\bboth\s+(.+?)\s+and\s+(.+?)(?:[?.!,;]|$)",
+            str(query or ""),
+            flags=re.IGNORECASE
+        )
+
+        if pair_match:
+            return self.analyze_ingredient_pair(
+                pair_match.group(1).strip(),
+                pair_match.group(2).strip(),
+                limit=limit
+            )
 
         fts_query = build_fts_query(
             query,
@@ -993,6 +1148,12 @@ class NoshAssistant:
 
     def match_ingredients(self, intent):
 
+        previous_action = self.state["last_action"]
+
+        previous_required = list(
+            self.state["active_required_ingredients"]
+        )
+
         # ------------------------------------------
         # Update active exclusions first.
         # ------------------------------------------
@@ -1023,10 +1184,78 @@ class NoshAssistant:
             if item not in removals
         ]
 
-        ingredients = (
-            intent.get("ingredients")
+        if intent.get("max_steps") is not None:
+            self.state["active_max_steps"] = intent["max_steps"]
+
+        incoming_ingredients = intent.get("ingredients") or []
+
+        def ingredient_keys(values):
+            keys = set()
+            for value in values:
+                spec = ingredient_matcher.parse_ingredient_spec(value)
+                if spec:
+                    keys.add(spec["name"])
+                else:
+                    keys.add(str(value).strip().casefold())
+            return keys
+
+        previous_keys = ingredient_keys(previous_required)
+        incoming_keys = ingredient_keys(incoming_ingredients)
+
+        same_matching_followup = (
+            previous_action == "match"
+            and bool(previous_required)
+            and (
+                not incoming_ingredients
+                or incoming_keys.issubset(previous_keys)
+            )
+        )
+
+        if incoming_ingredients and not same_matching_followup:
+            self.state["active_required_ingredients"] = list(
+                incoming_ingredients
+            )
+
+        ingredients = list(
+            incoming_ingredients
             or self.state["active_required_ingredients"]
         )
+
+        # A newly added exclusion removes that ingredient from the
+        # effective required list for an existing matching conversation.
+        # The original requirements remain stored so they can be restored
+        # if the exclusion is later removed.
+        if same_matching_followup and self.state["active_hard_exclusions"]:
+            exclusion_specs = [
+                ingredient_matcher.parse_ingredient_spec(item)
+                for item in self.state["active_hard_exclusions"]
+            ]
+
+            excluded_token_sets = [
+                set(spec["name"].split())
+                for spec in exclusion_specs
+                if spec and spec.get("name")
+            ]
+
+            effective_ingredients = []
+
+            for ingredient in ingredients:
+                spec = ingredient_matcher.parse_ingredient_spec(ingredient)
+                requested_tokens = (
+                    set(spec["name"].split())
+                    if spec and spec.get("name")
+                    else {str(ingredient).strip().casefold()}
+                )
+
+                conflicts_with_exclusion = any(
+                    tokens and tokens.issubset(requested_tokens)
+                    for tokens in excluded_token_sets
+                )
+
+                if not conflicts_with_exclusion:
+                    effective_ingredients.append(ingredient)
+
+            ingredients = effective_ingredients
 
         # ------------------------------------------
         # Exclusion-only follow-up to a recipe search.
@@ -1097,10 +1326,6 @@ class NoshAssistant:
                 "Tell me which ingredients the recipes should contain."
             )
 
-        self.state["active_required_ingredients"] = ingredients
-
-        self.state["active_required_ingredients"] = ingredients
-
         output = ingredient_matcher.match_recipes(
 
             ingredients=ingredients,
@@ -1115,6 +1340,8 @@ class NoshAssistant:
                 "prefer_fewer_steps",
                 False
             ),
+
+            max_steps=self.state["active_max_steps"],
 
         )
 
@@ -1285,6 +1512,8 @@ class NoshAssistant:
                 self.state["active_required_ingredients"]
             ),
 
+            "active_max_steps": self.state["active_max_steps"],
+
             "last_action": self.state["last_action"],
 
             "last_search_query": self.state["last_search_query"],
@@ -1359,6 +1588,8 @@ class NoshAssistant:
             "active_hard_exclusions": [],
 
             "active_required_ingredients": [],
+
+            "active_max_steps": None,
 
             "last_results": [],
 
@@ -1479,10 +1710,20 @@ class NoshAssistant:
 
                     self.state["last_action"] = "details"
 
-                    message = (
-                        f"Retrieved the original recipe: "
-                        f"{output['title']}."
-                    )
+                    if intent.get("nutrition_question"):
+                        message = (
+                            f"Retrieved the original recipe: "
+                            f"{output['title']}. "
+                            "Nutritional information, including calories, "
+                            "is not available in this recipe dataset. "
+                            "I cannot provide a reliable nutritional estimate "
+                            "from the available ingredients and instructions."
+                        )
+                    else:
+                        message = (
+                            f"Retrieved the original recipe: "
+                            f"{output['title']}."
+                        )
 
             # --------------------------------------
             # Recipe analytics.
@@ -1502,10 +1743,19 @@ class NoshAssistant:
 
                 self.state["last_action"] = "analytics"
 
-                message = (
-                    f"The complete filtered set contains "
-                    f"{output['total_recipes']:,} recipes."
-                )
+                if output.get("analysis_type") == "ingredient_cooccurrence":
+                    message = (
+                        f"{output['recipes_containing_both']:,} recipes "
+                        f"contain both {output['requested_ingredients'][0]} "
+                        f"and {output['requested_ingredients'][1]}. "
+                        f"That is {output['percentage_of_dataset']}% "
+                        f"of {output['dataset_recipe_count']:,} recipes."
+                    )
+                else:
+                    message = (
+                        f"The complete filtered set contains "
+                        f"{output['total_recipes']:,} recipes."
+                    )
 
             # --------------------------------------
             # Ingredient matching.
